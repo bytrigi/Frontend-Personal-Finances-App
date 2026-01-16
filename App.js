@@ -62,7 +62,7 @@ const AnimatedItem = ({ children, index }) => {
 };
 
 // --- COMPONENTE: FORMULARIO DE GASTO (AVANZADO) ---
-const ExpenseForm = ({ data, onConfirm }) => {
+const ExpenseForm = ({ data, onConfirm, isConfirmedProp }) => {
     const isIncome = data.tipo === 'income';
     
     const [concepto, setConcepto] = useState(data.concepto || "Nuevo movimiento");
@@ -75,14 +75,16 @@ const ExpenseForm = ({ data, onConfirm }) => {
     const [plazos, setPlazos] = useState((data.plazos || 1).toString());
     const [interes, setInteres] = useState((data.interes || 0).toString());
     
-    const [isConfirmed, setIsConfirmed] = useState(false);
+    // Estado local para confirmación inmediata
+    const [localConfirmed, setLocalConfirmed] = useState(false);
+    const confirmed = isConfirmedProp || localConfirmed;
 
     // Cálculo en tiempo real de la cuota
     const calcCuota = () => {
         const c = parseFloat(cantidad) || 0;
         const p = parseInt(plazos) || 1;
         const i = parseFloat(interes) || 0;
-        if (p === 1 && i === 0) return null; // No mostrar si es pago único sin interés
+        if (p === 1 && i === 0) return null; 
         
         const totalConInteres = c * (1 + (i / 100));
         const cuota = totalConInteres / p;
@@ -92,7 +94,7 @@ const ExpenseForm = ({ data, onConfirm }) => {
     const infoFinanciera = calcCuota();
 
     const handleConfirm = () => {
-        setIsConfirmed(true);
+        setLocalConfirmed(true); // Feedback visual instantáneo
         const hoy = new Date().toISOString().split('T')[0];
         
         const payload = {
@@ -107,16 +109,15 @@ const ExpenseForm = ({ data, onConfirm }) => {
             plazos: parseInt(plazos) || 1,
             interes: parseFloat(interes) || 0.0
         };
-        console.log("Payload:", payload);
         onConfirm(payload);
     };
 
-    if (isConfirmed) {
+    if (confirmed) {
         return (
-            <View style={[styles.confirmationBubble, isIncome ? {backgroundColor: '#E8F5E9'} : {backgroundColor: '#FFEBEE'}]}>
-                <Feather name="check-circle" size={20} color={isIncome ? "#34C759" : "#FF3B30"} />
-                <Text style={[styles.confirmationText, isIncome ? {color: '#2E7D32'} : {color: '#C62828'}]}>
-                    ¡Enviado!
+            <View style={[styles.confirmationBubble, isIncome ? {backgroundColor: '#E8F5E9'} : {backgroundColor: '#E3F2FD'}]}>
+                <Feather name="check-circle" size={20} color={isIncome ? "#34C759" : "#007AFF"} />
+                <Text style={[styles.confirmationText, isIncome ? {color: '#2E7D32'} : {color: '#0D47A1'}]}>
+                    ¡Añadido!
                 </Text>
             </View>
         );
@@ -234,23 +235,24 @@ export default function App() {
   const micScale = useRef(new Animated.Value(1)).current;
 
   // --- FETCHING ---
-  const fetchHistory = async () => {
+  const fetchHistory = async (force = false) => {
     try {
-      const response = await axios.get(`${API_URL}/historial`);
+      const response = await axios.get(`${API_URL}/historial`, { params: { force } });
       setTransactions(response.data.transactions);
     } catch (error) { console.error("Error historial:", error); }
   };
 
-  const fetchBalances = async () => {
+  const fetchBalances = async (force = false) => {
     try {
-      const response = await axios.get(`${API_URL}/balance`);
+      const response = await axios.get(`${API_URL}/balance`, { params: { force } });
       setBalances(response.data.accounts);
     } catch (error) { console.error("Error saldos:", error); }
   };
 
   const refreshAll = async () => {
       setIsLoadingHistory(true);
-      await Promise.all([fetchHistory(), fetchBalances()]);
+      // Enviamos force=true para obligar al backend a leer de Notion
+      await Promise.all([fetchHistory(true), fetchBalances(true)]);
       setIsLoadingHistory(false);
   };
 
@@ -346,14 +348,24 @@ export default function App() {
     finally { setLoading(false); }
   };
 
-  const handleConfirmExpense = async (finalData) => {
+  const handleConfirmExpense = async (finalData, index) => {
       try {
           const res = await axios.post(`${API_URL}/accion`, finalData);
-          if (res.data.status === 'ok') Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          if (res.data.status === 'ok') {
+              Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+              // ACTUALIZAMOS EL ESTADO DEL MENSAJE PARA QUE PERSISTA "AÑADIDO"
+              setMessages(prevMessages => {
+                  const updated = [...prevMessages];
+                  if (updated[index]) {
+                      updated[index].confirmed = true;
+                  }
+                  return updated;
+              });
+          }
       } catch (e) { console.error(e); }
   };
 
-  const renderChatMessage = ({ item }) => {
+  const renderChatMessage = ({ item, index }) => {
     let draftData = null;
     if (item.role === 'jarvis' && item.content.includes('"accion": "draft_gasto"')) {
         try {
@@ -361,7 +373,8 @@ export default function App() {
             if (parsed.accion === 'draft_gasto') draftData = parsed.datos;
         } catch (e) {}
     }
-    if (draftData) return <View style={[styles.messageBubble, styles.jarvisBubble, {backgroundColor: 'transparent', padding: 0, shadowOpacity: 0}]}><ExpenseForm data={draftData} onConfirm={handleConfirmExpense} /></View>;
+    // PASAMOS INDEX Y EL ESTADO DE CONFIRMACIÓN
+    if (draftData) return <View style={[styles.messageBubble, styles.jarvisBubble, {backgroundColor: 'transparent', padding: 0, shadowOpacity: 0}]}><ExpenseForm data={draftData} onConfirm={(data) => handleConfirmExpense(data, index)} isConfirmedProp={item.confirmed} /></View>;
     return <View style={[styles.messageBubble, item.role === 'user' ? styles.userBubble : styles.jarvisBubble]}>{item.role === 'user' ? <Text style={styles.userText}>{item.content}</Text> : <Markdown style={markdownStyles}>{item.content}</Markdown>}</View>;
   };
 
