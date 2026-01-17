@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { StyleSheet, Text, View, TextInput, TouchableOpacity, FlatList, ActivityIndicator, SafeAreaView, KeyboardAvoidingView, Platform, Modal, StatusBar, Animated, Keyboard, LayoutAnimation, UIManager, Dimensions, Image } from 'react-native';
+import { StyleSheet, Text, View, TextInput, TouchableOpacity, FlatList, ActivityIndicator, SafeAreaView, KeyboardAvoidingView, Platform, Modal, StatusBar, Animated, Keyboard, LayoutAnimation, UIManager, Dimensions, Image, PanResponder } from 'react-native';
 import axios from 'axios';
 import Markdown from 'react-native-markdown-display';
 import { Feather } from '@expo/vector-icons';
@@ -8,7 +8,6 @@ import { Audio } from 'expo-av';
 
 const LOGO_SANTANDER = require('./assets/santander_logo.png'); 
 const LOGO_PAYPAL = require('./assets/paypal_logo.png');
-// ASEGÚRATE DE QUE ESTA IP ES LA CORRECTA DE TU RASPBERRY
 const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://100.70.100.112:8000';
 
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
@@ -21,7 +20,6 @@ const MENU_WIDTH = width * 0.75;
 // --- HELPERS ---
 const parseAmount = (amountStr) => {
     try {
-        // Elimina símbolos y convierte a float
         return parseFloat(amountStr.replace('€', '').replace(',', '.').replace('+', ''));
     } catch (e) { return 0; }
 };
@@ -104,8 +102,7 @@ const TransactionItem = ({ item, index, showDate = true }) => (
                 <Text style={styles.transactionIcon}>{item.icon}</Text>
             </View>
             <View style={styles.transactionDetails}>
-                <Text style={styles.transactionTitle}>{item.title}</Text>
-                {/* CAMBIO: Ahora mostramos la fecha si showDate es true */}
+                <Text style={styles.transactionTitle} numberOfLines={1} ellipsizeMode="tail">{item.title}</Text>
                 {showDate && <Text style={styles.transactionDate}>{item.datePretty}</Text>}
             </View>
             <Text style={[styles.transactionAmount, item.type === 'income' ? styles.amountPositive : styles.amountNegative]}>{item.amount}</Text>
@@ -128,35 +125,26 @@ const AllMovementsPage = ({ transactions, isLoading, onBack, onRefresh }) => {
     const processedData = useMemo(() => {
         let data = [...transactions];
 
-        // 1. Buscador
         if (searchQuery) {
             const lowerQuery = searchQuery.toLowerCase();
             data = data.filter(t => t.title.toLowerCase().includes(lowerQuery));
         }
 
-        // 2. Filtro Tipo
         if (filterType !== 'all') {
             data = data.filter(t => t.type === filterType);
         }
 
-        // 3. Ordenación (LÓGICA MEJORADA)
         data.sort((a, b) => {
-            // Ordenar por fecha
             if (sortType === 'date_desc') return new Date(b.date) - new Date(a.date);
             if (sortType === 'date_asc') return new Date(a.date) - new Date(b.date);
             
-            // Ordenar por Cantidad
             const amountA = parseAmount(a.amount);
             const amountB = parseAmount(b.amount);
             
-            // CAMBIO CLAVE:
-            // Si estamos filtrando (solo gastos o solo ingresos), usamos Valor Absoluto.
-            // "Mayor a menor" significa "El gasto más grande" (-500 antes que -10).
             if (filterType !== 'all') {
                 if (sortType === 'amount_desc') return Math.abs(amountB) - Math.abs(amountA);
                 if (sortType === 'amount_asc') return Math.abs(amountA) - Math.abs(amountB);
             } else {
-                // Si es "Todos", mantenemos el orden matemático estricto (+20 es mayor que -500)
                 if (sortType === 'amount_desc') return amountB - amountA;
                 if (sortType === 'amount_asc') return amountA - amountB;
             }
@@ -230,7 +218,6 @@ const AllMovementsPage = ({ transactions, isLoading, onBack, onRefresh }) => {
             ) : (
                 <FlatList
                     data={processedData}
-                    // AQUÍ ESTÁ EL CAMBIO: showDate={true}
                     renderItem={({ item, index }) => <TransactionItem item={item} index={index} showDate={true} />}
                     keyExtractor={item => item.id}
                     contentContainerStyle={styles.transactionsList}
@@ -372,7 +359,18 @@ export default function App() {
   const inputRef = useRef(null);
   const micScale = useRef(new Animated.Value(1)).current;
 
-  // --- FETCHING ---
+  // --- SWIPE GESTURE ---
+  const panResponder = useRef(
+    PanResponder.create({
+      onMoveShouldSetPanResponder: (_, gestureState) => {
+        return !isMenuOpen && currentPage === 'home' && gestureState.dx > 20 && Math.abs(gestureState.dy) < 30;
+      },
+      onPanResponderRelease: (_, gestureState) => {
+        if (gestureState.dx > 50) toggleMenu();
+      },
+    })
+  ).current;
+
   const fetchHistory = async (force = false, all = false) => {
     try {
       const response = await axios.get(`${API_URL}/historial`, { params: { force, all } });
@@ -404,7 +402,6 @@ export default function App() {
   useEffect(() => {
     fetchHistory(false, false);
     fetchBalances(false);
-    
     let ws = null;
     let isMounted = true; 
     const connectWebSocket = () => {
@@ -433,7 +430,6 @@ export default function App() {
   useEffect(() => { if (flatListRef.current) flatListRef.current.scrollToEnd({ animated: true }); }, [messages]);
   const animateLayout = () => LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
 
-  // --- MENU & AUDIO ---
   const toggleMenu = () => {
     const toValue = isMenuOpen ? 0 : 1;
     Animated.parallel([
@@ -513,30 +509,30 @@ export default function App() {
       } catch (e) { console.error(e); }
   };
 
+  // --- PARSEADOR DE CHAT MEJORADO ---
   const renderChatMessage = ({ item, index }) => {
     let draftData = null;
-    if (item.role === 'jarvis' && item.content.includes('"accion": "draft_gasto"')) {
-        try {
-            const parsed = JSON.parse(item.content);
-            if (parsed.accion === 'draft_gasto') draftData = parsed.datos;
-        } catch (e) {}
-    }
+    try {
+        if (item.role === 'jarvis') {
+            // FIX: Limpiamos Markdown, comillas sueltas y buscamos el JSON real
+            let cleanContent = item.content.replace(/```json/g, '').replace(/```/g, '').trim();
+            // Buscar donde empieza y acaba el JSON
+            const firstBrace = cleanContent.indexOf('{');
+            const lastBrace = cleanContent.lastIndexOf('}');
+            
+            if (firstBrace !== -1 && lastBrace !== -1) {
+                const potentialJson = cleanContent.substring(firstBrace, lastBrace + 1);
+                if (potentialJson.includes('"accion": "draft_gasto"')) {
+                    const parsed = JSON.parse(potentialJson);
+                    if (parsed.accion === 'draft_gasto') draftData = parsed.datos;
+                }
+            }
+        }
+    } catch (e) {}
+
     if (draftData) return <View style={[styles.messageBubble, styles.jarvisBubble, {backgroundColor: 'transparent', padding: 0, shadowOpacity: 0}]}><ExpenseForm data={draftData} onConfirm={(data) => handleConfirmExpense(data, index)} isConfirmedProp={item.confirmed} /></View>;
     return <View style={[styles.messageBubble, item.role === 'user' ? styles.userBubble : styles.jarvisBubble]}>{item.role === 'user' ? <Text style={styles.userText}>{item.content}</Text> : <Markdown style={markdownStyles}>{item.content}</Markdown>}</View>;
   };
-
-  const renderTransactionItem = ({ item, index }) => (
-    <AnimatedItem index={index}>
-        <View style={styles.transactionItem}>
-          <View style={styles.transactionIconContainer}><Text style={styles.transactionIcon}>{item.icon}</Text></View>
-          <View style={styles.transactionDetails}>
-            <Text style={styles.transactionTitle}>{item.title}</Text>
-            <Text style={styles.transactionDate}>{formatDatePretty(item.date)}</Text>
-          </View>
-          <Text style={[styles.transactionAmount, item.type === 'income' ? styles.amountPositive : styles.amountNegative]}>{item.amount}</Text>
-        </View>
-    </AnimatedItem>
-  );
 
   const menuTranslateX = menuAnimation.interpolate({ inputRange: [0, 1], outputRange: [-MENU_WIDTH, 0] });
   const overlayOpacity = menuAnimation.interpolate({ inputRange: [0, 1], outputRange: [0, 0.5] });
@@ -544,6 +540,8 @@ export default function App() {
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="dark-content" />
+      
+      <View style={{flex: 1}} {...(currentPage === 'home' ? panResponder.panHandlers : {})}>
       {currentPage === 'home' ? (
           <View style={styles.mainContent}>
             <View style={styles.header}>
@@ -576,7 +574,7 @@ export default function App() {
                 <Feather name="arrow-right" size={16} color="#999" />
               </TouchableOpacity>
             </View>
-            {isLoadingHistory && transactions.length === 0 ? <View style={{ marginTop: 50, alignItems: 'center' }}><ActivityIndicator size="large" color="#000" /></View> : <FlatList data={transactions} renderItem={({ item, index }) => <TransactionItem item={item} index={index} showDate={true} />} keyExtractor={item => item.id} contentContainerStyle={styles.transactionsList} showsVerticalScrollIndicator={false} refreshing={isLoadingHistory} onRefresh={refreshAll} ListEmptyComponent={<Text style={{color: '#999', alignSelf: 'center', marginTop: 20}}>Sin movimientos.</Text>} />}
+            {isLoadingHistory && transactions.length === 0 ? <View style={{ marginTop: 50, alignItems: 'center' }}><ActivityIndicator size="large" color="#000" /></View> : <FlatList data={transactions.slice(0, 5)} renderItem={({ item, index }) => <TransactionItem item={item} index={index} showDate={true} />} keyExtractor={item => item.id} contentContainerStyle={styles.transactionsList} showsVerticalScrollIndicator={false} refreshing={isLoadingHistory} onRefresh={refreshAll} ListEmptyComponent={<Text style={{color: '#999', alignSelf: 'center', marginTop: 20}}>Sin movimientos.</Text>} />}
             <View style={styles.chatTriggerButton}>
               <TouchableOpacity style={styles.textTriggerArea} onPress={handleTextPress} activeOpacity={0.7}><Text style={styles.chatTriggerText}>Pregunta algo...</Text></TouchableOpacity>
               <TouchableOpacity style={styles.micTriggerArea} onPressIn={handleMicPressIn} onPressOut={handleMicPressOut} activeOpacity={1}><Animated.View style={{ transform: [{ scale: micScale }] }}><Feather name="mic" size={24} color="#FFF" /></Animated.View></TouchableOpacity>
@@ -585,6 +583,8 @@ export default function App() {
       ) : (
           <AllMovementsPage transactions={allTransactions} isLoading={isLoadingAll} onBack={() => setCurrentPage('home')} onRefresh={refreshAll} />
       )}
+      </View>
+
       <Animated.View style={[styles.menuOverlay, { opacity: overlayOpacity }]} pointerEvents={isMenuOpen ? 'auto' : 'none'}><TouchableOpacity style={{ flex: 1 }} onPress={closeMenu} /></Animated.View>
       <Animated.View style={[styles.sideMenuContainer, { transform: [{ translateX: menuTranslateX }] }]}><SafeAreaView style={{ flex: 1 }}><TouchableOpacity onPress={closeMenu} style={styles.closeMenuButton}><Feather name="x" size={24} color="#000" /></TouchableOpacity><View style={styles.profileSection}><View style={styles.profileImagePlaceholder} /><Text style={styles.profileName}>username</Text></View><View style={styles.menuItemsContainer}>{['Gastos', 'Planes de ahorro', 'Inversiones', 'Perfil', 'Datos Personales', 'Configuración', 'Ayuda'].map((item, index) => (<TouchableOpacity key={index} style={styles.menuItem} onPress={closeMenu}><Text style={styles.menuItemText}>{item}</Text></TouchableOpacity>))}</View></SafeAreaView></Animated.View>
       <Modal animationType="slide" transparent={false} visible={modalVisible} onRequestClose={() => setModalVisible(false)}>
@@ -615,7 +615,7 @@ const styles = StyleSheet.create({
   accountLabel: { fontSize: 12, color: '#666', fontWeight: '600', textTransform: 'uppercase' },
   accountAmount: { fontSize: 18, fontWeight: 'bold', color: '#000' },
   sectionTitle: { fontSize: 18, fontWeight: '700', marginBottom: 15, color: '#333' },
-  transactionsList: { paddingBottom: 80 },
+  transactionsList: { paddingBottom: 130 },
   transactionItem: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#FFF', padding: 15, borderRadius: 16, marginBottom: 10 },
   transactionIconContainer: { width: 45, height: 45, backgroundColor: '#F0F0F3', borderRadius: 22.5, justifyContent: 'center', alignItems: 'center', marginRight: 15 },
   transactionIcon: { fontSize: 22 },
