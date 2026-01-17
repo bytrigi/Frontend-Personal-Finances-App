@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { StyleSheet, Text, View, TextInput, TouchableOpacity, FlatList, ActivityIndicator, SafeAreaView, KeyboardAvoidingView, Platform, Modal, StatusBar, Animated, Keyboard, LayoutAnimation, UIManager, Dimensions, Image } from 'react-native';
 import axios from 'axios';
 import Markdown from 'react-native-markdown-display';
@@ -8,6 +8,7 @@ import { Audio } from 'expo-av';
 
 const LOGO_SANTANDER = require('./assets/santander_logo.png'); 
 const LOGO_PAYPAL = require('./assets/paypal_logo.png');
+// ASEGÚRATE DE QUE ESTA IP ES LA CORRECTA DE TU RASPBERRY
 const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://100.70.100.112:8000';
 
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
@@ -16,6 +17,14 @@ if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental
 
 const { width, height } = Dimensions.get('window');
 const MENU_WIDTH = width * 0.75; 
+
+// --- HELPERS ---
+const parseAmount = (amountStr) => {
+    try {
+        // Elimina símbolos y convierte a float
+        return parseFloat(amountStr.replace('€', '').replace(',', '.').replace('+', ''));
+    } catch (e) { return 0; }
+};
 
 // --- COMPONENTES VISUALES ---
 const HamburgerIcon = ({ isOpen, animation }) => {
@@ -61,53 +70,243 @@ const AnimatedItem = ({ children, index }) => {
   return <Animated.View style={{ opacity, transform: [{ translateY }] }}>{children}</Animated.View>;
 };
 
-// --- COMPONENTE: FORMULARIO DE GASTO (AVANZADO) ---
+// --- COMPONENTE: MODAL DE SELECCIÓN (FILTROS) ---
+const SelectionModal = ({ visible, onClose, title, options, onSelect, current }) => (
+    <Modal animationType="fade" transparent={true} visible={visible} onRequestClose={onClose}>
+        <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={onClose}>
+            <View style={styles.selectionModalContent}>
+                <Text style={styles.selectionModalTitle}>{title}</Text>
+                {options.map((opt) => (
+                    <TouchableOpacity 
+                        key={opt.value} 
+                        style={[styles.selectionOption, current === opt.value && styles.selectionOptionActive]}
+                        onPress={() => { onSelect(opt.value); onClose(); }}
+                    >
+                        <Text style={[styles.selectionText, current === opt.value && styles.selectionTextActive]}>
+                            {opt.label}
+                        </Text>
+                        {current === opt.value && <Feather name="check" size={18} color="#007AFF" />}
+                    </TouchableOpacity>
+                ))}
+                <TouchableOpacity style={styles.cancelButton} onPress={onClose}>
+                    <Text style={styles.cancelButtonText}>Cancelar</Text>
+                </TouchableOpacity>
+            </View>
+        </TouchableOpacity>
+    </Modal>
+);
+
+// --- COMPONENTE: ITEM DE TRANSACCIÓN ---
+const TransactionItem = ({ item, index, showDate = true }) => (
+    <AnimatedItem index={index}>
+        <View style={styles.transactionItem}>
+            <View style={styles.transactionIconContainer}>
+                <Text style={styles.transactionIcon}>{item.icon}</Text>
+            </View>
+            <View style={styles.transactionDetails}>
+                <Text style={styles.transactionTitle}>{item.title}</Text>
+                {/* CAMBIO: Ahora mostramos la fecha si showDate es true */}
+                {showDate && <Text style={styles.transactionDate}>{item.datePretty}</Text>}
+            </View>
+            <Text style={[styles.transactionAmount, item.type === 'income' ? styles.amountPositive : styles.amountNegative]}>{item.amount}</Text>
+        </View>
+    </AnimatedItem>
+);
+
+// --- PÁGINA: TODOS LOS MOVIMIENTOS ---
+const AllMovementsPage = ({ transactions, isLoading, onBack, onRefresh }) => {
+    const [searchQuery, setSearchQuery] = useState('');
+    const [isSearchActive, setIsSearchActive] = useState(false);
+    const [filterType, setFilterType] = useState('all'); 
+    const [sortType, setSortType] = useState('date_desc'); 
+    
+    const [showFilterModal, setShowFilterModal] = useState(false);
+    const [showSortModal, setShowSortModal] = useState(false);
+
+    const inputRef = useRef(null);
+
+    const processedData = useMemo(() => {
+        let data = [...transactions];
+
+        // 1. Buscador
+        if (searchQuery) {
+            const lowerQuery = searchQuery.toLowerCase();
+            data = data.filter(t => t.title.toLowerCase().includes(lowerQuery));
+        }
+
+        // 2. Filtro Tipo
+        if (filterType !== 'all') {
+            data = data.filter(t => t.type === filterType);
+        }
+
+        // 3. Ordenación (LÓGICA MEJORADA)
+        data.sort((a, b) => {
+            // Ordenar por fecha
+            if (sortType === 'date_desc') return new Date(b.date) - new Date(a.date);
+            if (sortType === 'date_asc') return new Date(a.date) - new Date(b.date);
+            
+            // Ordenar por Cantidad
+            const amountA = parseAmount(a.amount);
+            const amountB = parseAmount(b.amount);
+            
+            // CAMBIO CLAVE:
+            // Si estamos filtrando (solo gastos o solo ingresos), usamos Valor Absoluto.
+            // "Mayor a menor" significa "El gasto más grande" (-500 antes que -10).
+            if (filterType !== 'all') {
+                if (sortType === 'amount_desc') return Math.abs(amountB) - Math.abs(amountA);
+                if (sortType === 'amount_asc') return Math.abs(amountA) - Math.abs(amountB);
+            } else {
+                // Si es "Todos", mantenemos el orden matemático estricto (+20 es mayor que -500)
+                if (sortType === 'amount_desc') return amountB - amountA;
+                if (sortType === 'amount_asc') return amountA - amountB;
+            }
+            return 0;
+        });
+
+        return data;
+    }, [transactions, searchQuery, filterType, sortType]);
+
+    const toggleSearch = () => {
+        if (isSearchActive) {
+            setSearchQuery('');
+            setIsSearchActive(false);
+            Keyboard.dismiss();
+        } else {
+            setIsSearchActive(true);
+            setTimeout(() => inputRef.current?.focus(), 100);
+        }
+    };
+
+    return (
+        <View style={styles.mainContent}>
+            <View style={[styles.header, { justifyContent: 'flex-start' }]}>
+                <TouchableOpacity onPress={onBack} style={{ padding: 5, marginRight: 10 }}>
+                    <Feather name="arrow-left" size={24} color="#000" />
+                </TouchableOpacity>
+                <Text style={styles.headerTitle}>Todos tus movimientos</Text>
+            </View>
+
+            <View style={{height: 50, marginBottom: 15, justifyContent: 'center'}}>
+                {isSearchActive ? (
+                    <View style={styles.searchBarContainer}>
+                        <Feather name="search" size={18} color="#999" />
+                        <TextInput 
+                            ref={inputRef}
+                            style={styles.searchInput} 
+                            placeholder="Buscar movimiento..." 
+                            placeholderTextColor="#999"
+                            value={searchQuery}
+                            onChangeText={setSearchQuery}
+                        />
+                        <TouchableOpacity onPress={toggleSearch}>
+                            <Feather name="x" size={18} color="#666" />
+                        </TouchableOpacity>
+                    </View>
+                ) : (
+                    <View style={styles.filterBar}>
+                        <TouchableOpacity style={styles.filterButton} onPress={() => setShowFilterModal(true)}>
+                            <Feather name="filter" size={16} color="#666" style={{ marginRight: 5 }} />
+                            <Text style={styles.filterButtonText}>
+                                {filterType === 'all' ? 'Filtrar' : filterType === 'expense' ? 'Gastos' : 'Ingresos'}
+                            </Text>
+                        </TouchableOpacity>
+                        
+                        <TouchableOpacity style={styles.filterButton} onPress={() => setShowSortModal(true)}>
+                            <Feather name="align-left" size={16} color="#666" style={{ marginRight: 5 }} />
+                            <Text style={styles.filterButtonText}>Ordenar</Text>
+                        </TouchableOpacity>
+                        
+                        <View style={{ flex: 1 }} />
+                        
+                        <TouchableOpacity style={[styles.filterButton, { marginRight: 0 }]} onPress={toggleSearch}>
+                            <Feather name="search" size={20} color="#666" />
+                        </TouchableOpacity>
+                    </View>
+                )}
+            </View>
+
+            {isLoading && transactions.length === 0 ? (
+                <View style={{ marginTop: 50, alignItems: 'center' }}><ActivityIndicator size="large" color="#000" /></View>
+            ) : (
+                <FlatList
+                    data={processedData}
+                    // AQUÍ ESTÁ EL CAMBIO: showDate={true}
+                    renderItem={({ item, index }) => <TransactionItem item={item} index={index} showDate={true} />}
+                    keyExtractor={item => item.id}
+                    contentContainerStyle={styles.transactionsList}
+                    showsVerticalScrollIndicator={false}
+                    refreshing={isLoading}
+                    onRefresh={onRefresh}
+                    ListEmptyComponent={
+                        <View style={{alignItems: 'center', marginTop: 30}}>
+                            <Feather name="inbox" size={40} color="#CCC" />
+                            <Text style={{ color: '#999', marginTop: 10 }}>No se encontraron movimientos.</Text>
+                        </View>
+                    }
+                />
+            )}
+
+            <SelectionModal 
+                visible={showFilterModal} 
+                onClose={() => setShowFilterModal(false)}
+                title="Filtrar por tipo"
+                current={filterType}
+                onSelect={setFilterType}
+                options={[
+                    { label: 'Todos', value: 'all' },
+                    { label: 'Solo Gastos', value: 'expense' },
+                    { label: 'Solo Ingresos', value: 'income' },
+                ]}
+            />
+            <SelectionModal 
+                visible={showSortModal} 
+                onClose={() => setShowSortModal(false)}
+                title="Ordenar por"
+                current={sortType}
+                onSelect={setSortType}
+                options={[
+                    { label: 'Fecha (Más reciente)', value: 'date_desc' },
+                    { label: 'Fecha (Más antiguo)', value: 'date_asc' },
+                    { label: 'Cantidad (Mayor a menor)', value: 'amount_desc' },
+                    { label: 'Cantidad (Menor a mayor)', value: 'amount_asc' },
+                ]}
+            />
+        </View>
+    );
+};
+
+// --- COMPONENTE: FORMULARIO DE GASTO ---
 const ExpenseForm = ({ data, onConfirm, isConfirmedProp }) => {
     const isIncome = data.tipo === 'income';
-    
     const [concepto, setConcepto] = useState(data.concepto || "Nuevo movimiento");
     const [cantidad, setCantidad] = useState((data.cantidad || 0).toString());
     const [categoria, setCategoria] = useState(data.categoria || "Otros");
     const [cuenta, setCuenta] = useState(data.cuenta_nombre || "Bancaria");
     const [notas, setNotas] = useState(data.anotaciones || "");
-    
-    // Campos Financieros Avanzados
     const [plazos, setPlazos] = useState((data.plazos || 1).toString());
     const [interes, setInteres] = useState((data.interes || 0).toString());
-    
-    // Estado local para confirmación inmediata
     const [localConfirmed, setLocalConfirmed] = useState(false);
     const confirmed = isConfirmedProp || localConfirmed;
 
-    // Cálculo en tiempo real de la cuota
     const calcCuota = () => {
         const c = parseFloat(cantidad) || 0;
         const p = parseInt(plazos) || 1;
         const i = parseFloat(interes) || 0;
         if (p === 1 && i === 0) return null; 
-        
         const totalConInteres = c * (1 + (i / 100));
         const cuota = totalConInteres / p;
         return { total: totalConInteres.toFixed(2), mensual: cuota.toFixed(2) };
     };
-
     const infoFinanciera = calcCuota();
 
     const handleConfirm = () => {
-        setLocalConfirmed(true); // Feedback visual instantáneo
+        setLocalConfirmed(true); 
         const hoy = new Date().toISOString().split('T')[0];
-        
         const payload = {
-            tipo: data.tipo || 'expense',
-            concepto: concepto,
-            cantidad: parseFloat(cantidad) || 0.0,
-            fecha: data.fecha || hoy,
-            cuenta_nombre: cuenta,
-            categoria: isIncome ? 'Ingreso' : categoria,
-            status: isIncome ? "Recibido" : "Pagado",
-            anotaciones: notas,
-            plazos: parseInt(plazos) || 1,
-            interes: parseFloat(interes) || 0.0
+            tipo: data.tipo || 'expense', concepto: concepto, cantidad: parseFloat(cantidad) || 0.0,
+            fecha: data.fecha || hoy, cuenta_nombre: cuenta,
+            categoria: isIncome ? 'Ingreso' : categoria, status: isIncome ? "Recibido" : "Pagado",
+            anotaciones: notas, plazos: parseInt(plazos) || 1, interes: parseFloat(interes) || 0.0
         };
         onConfirm(payload);
     };
@@ -116,95 +315,31 @@ const ExpenseForm = ({ data, onConfirm, isConfirmedProp }) => {
         return (
             <View style={[styles.confirmationBubble, isIncome ? {backgroundColor: '#E8F5E9'} : {backgroundColor: '#E3F2FD'}]}>
                 <Feather name="check-circle" size={20} color={isIncome ? "#34C759" : "#007AFF"} />
-                <Text style={[styles.confirmationText, isIncome ? {color: '#2E7D32'} : {color: '#0D47A1'}]}>
-                    ¡Añadido!
-                </Text>
+                <Text style={[styles.confirmationText, isIncome ? {color: '#2E7D32'} : {color: '#0D47A1'}]}>¡Añadido!</Text>
             </View>
         );
     }
 
     return (
         <View style={styles.formContainer}>
-            <Text style={[styles.formHeader, {color: isIncome ? '#34C759' : '#FF3B30'}]}>
-                {isIncome ? 'NUEVO INGRESO' : 'NUEVO GASTO'}
-            </Text>
-
-            {/* Asunto */}
-            <View style={styles.formRow}>
-                <Text style={styles.formLabel}>Asunto:</Text>
-                <TextInput style={styles.formInput} value={concepto} onChangeText={setConcepto} />
-            </View>
-            
-            {/* Importe y Cuenta */}
+            <Text style={[styles.formHeader, {color: isIncome ? '#34C759' : '#FF3B30'}]}>{isIncome ? 'NUEVO INGRESO' : 'NUEVO GASTO'}</Text>
+            <View style={styles.formRow}><Text style={styles.formLabel}>Asunto:</Text><TextInput style={styles.formInput} value={concepto} onChangeText={setConcepto} /></View>
             <View style={{flexDirection: 'row', gap: 10}}>
-                <View style={[styles.formRow, {flex: 1}]}>
-                    <Text style={styles.formLabel}>Importe:</Text>
-                    <View style={{flexDirection: 'row', alignItems: 'center'}}>
-                        <TextInput 
-                            style={[styles.formInput, {fontWeight: 'bold', flex: 1}]} 
-                            value={cantidad} onChangeText={setCantidad} keyboardType="numeric"
-                        />
-                        <Text style={{marginLeft: 5, color: '#666'}}>€</Text>
-                    </View>
-                </View>
-                <View style={[styles.formRow, {flex: 1}]}>
-                    <Text style={styles.formLabel}>Cuenta:</Text>
-                    <TextInput style={styles.formInput} value={cuenta} onChangeText={setCuenta} />
-                </View>
+                <View style={[styles.formRow, {flex: 1}]}><Text style={styles.formLabel}>Importe:</Text><View style={{flexDirection: 'row', alignItems: 'center'}}><TextInput style={[styles.formInput, {fontWeight: 'bold', flex: 1}]} value={cantidad} onChangeText={setCantidad} keyboardType="numeric"/><Text style={{marginLeft: 5, color: '#666'}}>€</Text></View></View>
+                <View style={[styles.formRow, {flex: 1}]}><Text style={styles.formLabel}>Cuenta:</Text><TextInput style={styles.formInput} value={cuenta} onChangeText={setCuenta} /></View>
             </View>
-
-            {/* Solo Gastos: Categoría y Financiación */}
             {!isIncome && (
                 <>
-                    <View style={styles.formRow}>
-                        <Text style={styles.formLabel}>Categoría:</Text>
-                        <TextInput style={styles.formInput} value={categoria} onChangeText={setCategoria} />
-                    </View>
-
-                    {/* Fila de Financiación */}
+                    <View style={styles.formRow}><Text style={styles.formLabel}>Categoría:</Text><TextInput style={styles.formInput} value={categoria} onChangeText={setCategoria} /></View>
                     <View style={{flexDirection: 'row', gap: 10, backgroundColor: '#F2F2F7', padding: 8, borderRadius: 8, marginBottom: 10}}>
-                        <View style={{flex: 1}}>
-                            <Text style={styles.formLabel}>Plazos:</Text>
-                            <TextInput 
-                                style={[styles.formInput, {backgroundColor: '#FFF'}]} 
-                                value={plazos} onChangeText={setPlazos} keyboardType="number-pad" 
-                            />
-                        </View>
-                        <View style={{flex: 1}}>
-                            <Text style={styles.formLabel}>Interés %:</Text>
-                            <TextInput 
-                                style={[styles.formInput, {backgroundColor: '#FFF'}]} 
-                                value={interes} onChangeText={setInteres} keyboardType="numeric" 
-                            />
-                        </View>
+                        <View style={{flex: 1}}><Text style={styles.formLabel}>Plazos:</Text><TextInput style={[styles.formInput, {backgroundColor: '#FFF'}]} value={plazos} onChangeText={setPlazos} keyboardType="number-pad" /></View>
+                        <View style={{flex: 1}}><Text style={styles.formLabel}>Interés %:</Text><TextInput style={[styles.formInput, {backgroundColor: '#FFF'}]} value={interes} onChangeText={setInteres} keyboardType="numeric" /></View>
                     </View>
-
-                    {/* Info Calculada */}
-                    {infoFinanciera && (
-                        <View style={{marginBottom: 10, padding: 5}}>
-                            <Text style={{fontSize: 12, color: '#666'}}>
-                                Total a pagar: <Text style={{fontWeight: 'bold'}}>{infoFinanciera.total}€</Text>
-                            </Text>
-                            <Text style={{fontSize: 12, color: '#000', fontWeight: 'bold'}}>
-                                Cuota mensual: {infoFinanciera.mensual}€ / mes
-                            </Text>
-                        </View>
-                    )}
+                    {infoFinanciera && (<View style={{marginBottom: 10, padding: 5}}><Text style={{fontSize: 12, color: '#666'}}>Total a pagar: <Text style={{fontWeight: 'bold'}}>{infoFinanciera.total}€</Text></Text><Text style={{fontSize: 12, color: '#000', fontWeight: 'bold'}}>Cuota mensual: {infoFinanciera.mensual}€ / mes</Text></View>)}
                 </>
             )}
-
-            <View style={styles.formRow}>
-                <Text style={styles.formLabel}>Notas:</Text>
-                <TextInput style={styles.formInput} value={notas} onChangeText={setNotas} multiline />
-            </View>
-
-            <View style={styles.formActions}>
-                <TouchableOpacity 
-                    style={[styles.confirmButton, isIncome ? {backgroundColor: '#34C759'} : {backgroundColor: '#000'}]} 
-                    onPress={handleConfirm}>
-                    <Text style={styles.confirmButtonText}>Confirmar</Text>
-                </TouchableOpacity>
-            </View>
+            <View style={styles.formRow}><Text style={styles.formLabel}>Notas:</Text><TextInput style={styles.formInput} value={notas} onChangeText={setNotas} multiline /></View>
+            <View style={styles.formActions}><TouchableOpacity style={[styles.confirmButton, isIncome ? {backgroundColor: '#34C759'} : {backgroundColor: '#000'}]} onPress={handleConfirm}><Text style={styles.confirmButtonText}>Confirmar</Text></TouchableOpacity></View>
         </View>
     );
 };
@@ -216,6 +351,9 @@ export default function App() {
     return new Intl.DateTimeFormat('es-ES', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).format(date);
   };
 
+  const [currentPage, setCurrentPage] = useState('home');
+  const [allTransactions, setAllTransactions] = useState([]);
+  const [isLoadingAll, setIsLoadingAll] = useState(false);
   const [modalVisible, setModalVisible] = useState(false);
   const [prompt, setPrompt] = useState('');
   const [messages, setMessages] = useState([]);
@@ -235,10 +373,12 @@ export default function App() {
   const micScale = useRef(new Animated.Value(1)).current;
 
   // --- FETCHING ---
-  const fetchHistory = async (force = false) => {
+  const fetchHistory = async (force = false, all = false) => {
     try {
-      const response = await axios.get(`${API_URL}/historial`, { params: { force } });
-      setTransactions(response.data.transactions);
+      const response = await axios.get(`${API_URL}/historial`, { params: { force, all } });
+      const formattedData = response.data.transactions.map(t => ({...t, datePretty: formatDatePretty(t.date)}));
+      if (all) setAllTransactions(formattedData);
+      else setTransactions(formattedData);
     } catch (error) { console.error("Error historial:", error); }
   };
 
@@ -250,14 +390,21 @@ export default function App() {
   };
 
   const refreshAll = async () => {
-      setIsLoadingHistory(true);
-      // Enviamos force=true para obligar al backend a leer de Notion
-      await Promise.all([fetchHistory(true), fetchBalances(true)]);
-      setIsLoadingHistory(false);
+      if (currentPage === 'home') {
+          setIsLoadingHistory(true);
+          await Promise.all([fetchHistory(true, false), fetchBalances(true)]);
+          setIsLoadingHistory(false);
+      } else {
+          setIsLoadingAll(true);
+          await fetchHistory(true, true);
+          setIsLoadingAll(false);
+      }
   };
 
   useEffect(() => {
-    refreshAll();
+    fetchHistory(false, false);
+    fetchBalances(false);
+    
     let ws = null;
     let isMounted = true; 
     const connectWebSocket = () => {
@@ -275,6 +422,13 @@ export default function App() {
     connectWebSocket();
     return () => { isMounted = false; if (ws) ws.close(); };
   }, []);
+
+  useEffect(() => {
+      if (currentPage === 'allMovements' && allTransactions.length === 0) {
+          setIsLoadingAll(true);
+          fetchHistory(false, true).then(() => setIsLoadingAll(false));
+      }
+  }, [currentPage]);
 
   useEffect(() => { if (flatListRef.current) flatListRef.current.scrollToEnd({ animated: true }); }, [messages]);
   const animateLayout = () => LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
@@ -328,18 +482,15 @@ export default function App() {
   const handleMicPressOut = () => { Animated.timing(micScale, { toValue: 1, duration: 100, useNativeDriver: true }).start(() => { setModalVisible(true); setTimeout(() => { startRecording(); }, 300); }); };
   const handleSmallMicPress = () => { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium); Keyboard.dismiss(); animateLayout(); setIsRecording(true); setTimeout(() => { startRecording(); }, 300); };
 
-  // --- LOGICA CHAT ---
   const sendMessage = async () => {
     if (!prompt.trim()) return;
     if (isRecording) { try { await recording.stopAndUnloadAsync(); } catch (e) {} setRecording(undefined); setIsRecording(false); }
     if (isTranscribing) setIsTranscribing(false);
-
     const userMessage = { role: 'user', content: prompt };
     const newHistory = [...messages, userMessage];
     setMessages(newHistory);
     setPrompt('');
     setLoading(true);
-
     try {
       const apiHistory = newHistory.filter(msg => !msg.content.includes('"accion": "draft_gasto"')).map(msg => ({ role: msg.role === 'jarvis' ? 'assistant' : msg.role, content: msg.content }));
       const response = await axios.post(`${API_URL}/chat`, { messages: apiHistory });
@@ -353,12 +504,9 @@ export default function App() {
           const res = await axios.post(`${API_URL}/accion`, finalData);
           if (res.data.status === 'ok') {
               Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-              // ACTUALIZAMOS EL ESTADO DEL MENSAJE PARA QUE PERSISTA "AÑADIDO"
               setMessages(prevMessages => {
                   const updated = [...prevMessages];
-                  if (updated[index]) {
-                      updated[index].confirmed = true;
-                  }
+                  if (updated[index]) updated[index].confirmed = true;
                   return updated;
               });
           }
@@ -373,7 +521,6 @@ export default function App() {
             if (parsed.accion === 'draft_gasto') draftData = parsed.datos;
         } catch (e) {}
     }
-    // PASAMOS INDEX Y EL ESTADO DE CONFIRMACIÓN
     if (draftData) return <View style={[styles.messageBubble, styles.jarvisBubble, {backgroundColor: 'transparent', padding: 0, shadowOpacity: 0}]}><ExpenseForm data={draftData} onConfirm={(data) => handleConfirmExpense(data, index)} isConfirmedProp={item.confirmed} /></View>;
     return <View style={[styles.messageBubble, item.role === 'user' ? styles.userBubble : styles.jarvisBubble]}>{item.role === 'user' ? <Text style={styles.userText}>{item.content}</Text> : <Markdown style={markdownStyles}>{item.content}</Markdown>}</View>;
   };
@@ -397,37 +544,47 @@ export default function App() {
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="dark-content" />
-      <View style={styles.mainContent}>
-        <View style={styles.header}>
-          <TouchableOpacity onPress={toggleMenu} style={styles.menuButton}><HamburgerIcon isOpen={isMenuOpen} animation={iconAnimation} /></TouchableOpacity>
-          <Text style={styles.headerTitle}>Bienvenido, username</Text>
-          <View style={{ width: 24 }} /> 
-        </View>
-        <View style={styles.headerSection}>
-          <Text style={styles.sectionTitle}>Tu saldo actual</Text>
-          <View style={styles.card}>
-             {balances.length === 0 && isLoadingHistory ? <ActivityIndicator color="#999" size="small" /> : balances.map((account, index) => {
-                  let logo = null;
-                  const nameLower = account.name.toLowerCase();
-                  if (nameLower.includes('paypal')) logo = LOGO_PAYPAL;
-                  else if (nameLower.includes('bancaria') || nameLower.includes('santander')) logo = LOGO_SANTANDER;
-                  return (
-                    <View key={account.id} style={[styles.row, { marginTop: index > 0 ? 15 : 0 }]}>
-                        {logo ? <Image source={logo} style={styles.bankLogo} resizeMode="contain" /> : <Text style={{fontSize: 24}}>🏦</Text>}
-                        <View style={{marginLeft: 10}}><Text style={styles.accountLabel}>{account.name}</Text><Text style={styles.accountAmount}>{account.balance}</Text></View>
-                    </View>
-                  );
-                })
-             }
+      {currentPage === 'home' ? (
+          <View style={styles.mainContent}>
+            <View style={styles.header}>
+              <TouchableOpacity onPress={toggleMenu} style={styles.menuButton}><HamburgerIcon isOpen={isMenuOpen} animation={iconAnimation} /></TouchableOpacity>
+              <Text style={styles.headerTitle}>Bienvenido, username</Text>
+              <View style={{ width: 24 }} /> 
+            </View>
+            <View style={styles.headerSection}>
+              <Text style={styles.sectionTitle}>Tu saldo actual</Text>
+              <View style={styles.card}>
+                 {balances.length === 0 && isLoadingHistory ? <ActivityIndicator color="#999" size="small" /> : balances.map((account, index) => {
+                      let logo = null;
+                      const nameLower = account.name.toLowerCase();
+                      if (nameLower.includes('paypal')) logo = LOGO_PAYPAL;
+                      else if (nameLower.includes('bancaria') || nameLower.includes('santander')) logo = LOGO_SANTANDER;
+                      return (
+                        <View key={account.id} style={[styles.row, { marginTop: index > 0 ? 15 : 0 }]}>
+                            {logo ? <Image source={logo} style={styles.bankLogo} resizeMode="contain" /> : <Text style={{fontSize: 24}}>🏦</Text>}
+                            <View style={{marginLeft: 10}}><Text style={styles.accountLabel}>{account.name}</Text><Text style={styles.accountAmount}>{account.balance}</Text></View>
+                        </View>
+                      );
+                    })
+                 }
+              </View>
+            </View>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 15 }}>
+              <Text style={{ fontSize: 18, fontWeight: '700', color: '#333' }}>Últimos movimientos</Text>
+              <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center' }} onPress={() => setCurrentPage('allMovements')}>
+                <Text style={{ fontSize: 14, color: '#999', marginRight: 5 }}>Ver todos</Text>
+                <Feather name="arrow-right" size={16} color="#999" />
+              </TouchableOpacity>
+            </View>
+            {isLoadingHistory && transactions.length === 0 ? <View style={{ marginTop: 50, alignItems: 'center' }}><ActivityIndicator size="large" color="#000" /></View> : <FlatList data={transactions} renderItem={({ item, index }) => <TransactionItem item={item} index={index} showDate={true} />} keyExtractor={item => item.id} contentContainerStyle={styles.transactionsList} showsVerticalScrollIndicator={false} refreshing={isLoadingHistory} onRefresh={refreshAll} ListEmptyComponent={<Text style={{color: '#999', alignSelf: 'center', marginTop: 20}}>Sin movimientos.</Text>} />}
+            <View style={styles.chatTriggerButton}>
+              <TouchableOpacity style={styles.textTriggerArea} onPress={handleTextPress} activeOpacity={0.7}><Text style={styles.chatTriggerText}>Pregunta algo...</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.micTriggerArea} onPressIn={handleMicPressIn} onPressOut={handleMicPressOut} activeOpacity={1}><Animated.View style={{ transform: [{ scale: micScale }] }}><Feather name="mic" size={24} color="#FFF" /></Animated.View></TouchableOpacity>
+            </View>
           </View>
-        </View>
-        <Text style={styles.sectionTitle}>Últimos movimientos</Text>
-        {isLoadingHistory && transactions.length === 0 ? <View style={{ marginTop: 50, alignItems: 'center' }}><ActivityIndicator size="large" color="#000" /></View> : <FlatList data={transactions} renderItem={renderTransactionItem} keyExtractor={item => item.id} contentContainerStyle={styles.transactionsList} showsVerticalScrollIndicator={false} refreshing={isLoadingHistory} onRefresh={refreshAll} ListEmptyComponent={<Text style={{color: '#999', alignSelf: 'center', marginTop: 20}}>Sin movimientos.</Text>} />}
-        <View style={styles.chatTriggerButton}>
-          <TouchableOpacity style={styles.textTriggerArea} onPress={handleTextPress} activeOpacity={0.7}><Text style={styles.chatTriggerText}>Pregunta algo...</Text></TouchableOpacity>
-          <TouchableOpacity style={styles.micTriggerArea} onPressIn={handleMicPressIn} onPressOut={handleMicPressOut} activeOpacity={1}><Animated.View style={{ transform: [{ scale: micScale }] }}><Feather name="mic" size={24} color="#FFF" /></Animated.View></TouchableOpacity>
-        </View>
-      </View>
+      ) : (
+          <AllMovementsPage transactions={allTransactions} isLoading={isLoadingAll} onBack={() => setCurrentPage('home')} onRefresh={refreshAll} />
+      )}
       <Animated.View style={[styles.menuOverlay, { opacity: overlayOpacity }]} pointerEvents={isMenuOpen ? 'auto' : 'none'}><TouchableOpacity style={{ flex: 1 }} onPress={closeMenu} /></Animated.View>
       <Animated.View style={[styles.sideMenuContainer, { transform: [{ translateX: menuTranslateX }] }]}><SafeAreaView style={{ flex: 1 }}><TouchableOpacity onPress={closeMenu} style={styles.closeMenuButton}><Feather name="x" size={24} color="#000" /></TouchableOpacity><View style={styles.profileSection}><View style={styles.profileImagePlaceholder} /><Text style={styles.profileName}>username</Text></View><View style={styles.menuItemsContainer}>{['Gastos', 'Planes de ahorro', 'Inversiones', 'Perfil', 'Datos Personales', 'Configuración', 'Ayuda'].map((item, index) => (<TouchableOpacity key={index} style={styles.menuItem} onPress={closeMenu}><Text style={styles.menuItemText}>{item}</Text></TouchableOpacity>))}</View></SafeAreaView></Animated.View>
       <Modal animationType="slide" transparent={false} visible={modalVisible} onRequestClose={() => setModalVisible(false)}>
@@ -501,7 +658,6 @@ const styles = StyleSheet.create({
   audioButtonPlaceholder: { width: 45, height: 45, borderRadius: 25, backgroundColor: 'transparent', justifyContent: 'center', alignItems: 'center' },
   waveContainer: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 4, height: 40 },
   waveBar: { width: 4, backgroundColor: '#FFF', borderRadius: 2 },
-  // ESTILOS NUEVOS PARA EL FORM
   formContainer: { backgroundColor: '#E5E5EA', padding: 20, borderRadius: 15, width: 280 },
   formHeader: { fontSize: 14, fontWeight: '900', marginBottom: 15, letterSpacing: 1 },
   formRow: { marginBottom: 10 },
@@ -512,7 +668,21 @@ const styles = StyleSheet.create({
   confirmButton: { paddingVertical: 8, paddingHorizontal: 20, borderRadius: 20 },
   confirmButtonText: { color: '#FFF', fontWeight: 'bold', fontSize: 16 },
   confirmationBubble: { flexDirection: 'row', alignItems: 'center', padding: 10, borderRadius: 15, gap: 10 },
-  confirmationText: { fontWeight: 'bold' }
+  confirmationText: { fontWeight: 'bold' },
+  filterBar: { flexDirection: 'row', alignItems: 'center', marginBottom: 20 },
+  filterButton: { flexDirection: 'row', alignItems: 'center', marginRight: 20 },
+  filterButtonText: { fontSize: 16, color: '#666', fontWeight: '600' },
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' },
+  selectionModalContent: { backgroundColor: '#FFF', borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 20, paddingBottom: 40 },
+  selectionModalTitle: { fontSize: 18, fontWeight: 'bold', marginBottom: 15, textAlign: 'center' },
+  selectionOption: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 15, borderBottomWidth: 1, borderBottomColor: '#F2F2F7' },
+  selectionOptionActive: { backgroundColor: '#F9F9F9' },
+  selectionText: { fontSize: 16, color: '#333' },
+  selectionTextActive: { color: '#007AFF', fontWeight: 'bold' },
+  cancelButton: { marginTop: 15, paddingVertical: 10, alignItems: 'center' },
+  cancelButtonText: { fontSize: 16, color: '#FF3B30', fontWeight: '600' },
+  searchBarContainer: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#FFF', borderRadius: 10, paddingHorizontal: 10, flex: 1, height: 40 },
+  searchInput: { flex: 1, marginLeft: 10, fontSize: 16, color: '#000' },
 });
 
 const markdownStyles = {
